@@ -52,20 +52,9 @@ SitePulse/
 
 See [`docs/README.md`](docs/README.md) for the full deploy guide, API reference, and architecture details.
 
-## Quick Deploy
+## 🚀 Live Demo
 
-```bash
-# 1. Deploy AWS infrastructure
-cd infrastructure
-sam build && sam deploy --guided \
-  --parameter-overrides AlertEmail=you@example.com
-
-# 2. Connect frontend
-echo "VITE_API_URL=<your-api-gateway-url>" > frontend/.env.local
-
-# 3. Run
-cd frontend && npm run dev
-```
+[Open SitePulse](https://d2y8a0076i820k.cloudfront.net)
 
 ## License
 
