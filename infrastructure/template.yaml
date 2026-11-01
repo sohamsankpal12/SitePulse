@@ -1,0 +1,497 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  SitePulse — Serverless Website Uptime Monitoring Platform
+  Infrastructure: DynamoDB, Lambda, API Gateway, EventBridge, SNS, Cognito
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        WEBSITES_TABLE: !Ref WebsitesTable
+        CHECKS_TABLE: !Ref ChecksTable
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        SETTINGS_TABLE: !Ref SettingsTable
+        SNS_TOPIC_ARN: !Ref AlertsTopic
+        FRONTEND_ORIGIN: !Sub 'https://${CloudFrontDistribution.DomainName}'
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+    Layers:
+      - !Ref DepsLayer
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, prod]
+  AlertEmail:
+    Type: String
+    Description: Default email for SNS alert subscription
+  DemoMode:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+# ─── Layers ───────────────────────────────────────────────────────────────────
+Resources:
+  DepsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: sitepulse-deps
+      ContentUri: ../backend/layer/
+      CompatibleRuntimes:
+        - nodejs20.x
+    Metadata:
+      BuildMethod: nodejs20.x
+
+# ─── DynamoDB Tables ──────────────────────────────────────────────────────────
+  WebsitesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'sitepulse-websites-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: websiteId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: enabled
+          AttributeType: N
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: websiteId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: enabled-index
+          KeySchema:
+            - AttributeName: enabled
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  ChecksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'sitepulse-checks-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: websiteId
+          AttributeType: S
+        - AttributeName: checkedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: websiteId
+          KeyType: HASH
+        - AttributeName: checkedAt
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'sitepulse-incidents-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incidentId
+          AttributeType: S
+        - AttributeName: websiteId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: startedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incidentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: websiteId-startedAt-index
+          KeySchema:
+            - AttributeName: websiteId
+              KeyType: HASH
+            - AttributeName: startedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: userId-startedAt-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: startedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  SettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'sitepulse-settings-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: settingId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: settingId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+# ─── Cognito ──────────────────────────────────────────────────────────────────
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'sitepulse-users-${Environment}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: sitepulse-app
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+
+# ─── SNS ─────────────────────────────────────────────────────────────────────
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'sitepulse-alerts-${Environment}'
+      DisplayName: SitePulse Monitoring Alerts
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+# ─── API Gateway ──────────────────────────────────────────────────────────────
+  SitePulseApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'sitepulse-api-${Environment}'
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+
+# ─── Lambda Functions ─────────────────────────────────────────────────────────
+  WebsitesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'sitepulse-websites-${Environment}'
+      CodeUri: ../backend/functions/websites/
+      Handler: index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WebsitesTable
+      Events:
+        ListCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /websites
+            Method: ANY
+        GetUpdateDelete:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /websites/{id}
+            Method: ANY
+
+  ChecksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'sitepulse-checks-${Environment}'
+      CodeUri: ../backend/functions/checks/
+      Handler: index.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ChecksTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref WebsitesTable
+      Events:
+        GetChecks:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /websites/{id}/checks
+            Method: GET
+
+  IncidentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'sitepulse-incidents-${Environment}'
+      CodeUri: ../backend/functions/incidents/
+      Handler: index.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        ListIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /incidents
+            Method: GET
+        GetIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /incidents/{id}
+            Method: GET
+
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'sitepulse-dashboard-${Environment}'
+      CodeUri: ../backend/functions/dashboard/
+      Handler: index.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref WebsitesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        DashboardStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /dashboard/stats
+            Method: GET
+
+  NotificationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'sitepulse-notifications-${Environment}'
+      CodeUri: ../backend/functions/notifications/
+      Handler: index.handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsTopic.TopicName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SettingsTable
+      Events:
+        ManageNotifications:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /notifications
+            Method: ANY
+        NotificationsEmail:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SitePulseApi
+            Path: /notifications/email
+            Method: POST
+
+  MonitorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'sitepulse-monitor-${Environment}'
+      CodeUri: ../backend/functions/monitor/
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          REQUEST_TIMEOUT_MS: '10000'
+          FAILURE_THRESHOLD: '2'
+          MAX_CONCURRENT: '10'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WebsitesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChecksTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsTopic.TopicName
+      Events:
+        ScheduledCheck:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Name: !Sub 'sitepulse-monitor-schedule-${Environment}'
+            Description: Run SitePulse monitoring checks every minute
+            Enabled: true
+
+# ─── S3 Frontend Bucket ───────────────────────────────────────────────────────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'sitepulse-frontend-${AWS::AccountId}-${Environment}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+# ─── CloudFront ───────────────────────────────────────────────────────────────
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'sitepulse-oac-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: SitePulse Frontend CDN
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Description: API Gateway base URL
+    Value: !Sub 'https://${SitePulseApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: SitePulseApiUrl
+
+  FrontendUrl:
+    Description: CloudFront distribution URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: SitePulseCognitoUserPoolId
+
+  CognitoClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: SitePulseCognitoClientId
+
+  SnsTopicArn:
+    Description: SNS Alerts Topic ARN
+    Value: !Ref AlertsTopic
+
+  FrontendBucketName:
+    Description: S3 bucket for frontend assets
+    Value: !Ref FrontendBucket
+
+  WebsitesTableName:
+    Value: !Ref WebsitesTable
+  ChecksTableName:
+    Value: !Ref ChecksTable
+  IncidentsTableName:
+    Value: !Ref IncidentsTable
